@@ -3,86 +3,69 @@ package producer
 import (
 	"context"
 	"fmt"
-	"sync"
+	"log/slog"
 
-	"github.com/giicoo/ecst-go/config"
-	"github.com/giicoo/ecst-go/envelope"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 type Producer struct {
-	client    *kgo.Client
-	closeOnce sync.Once
+	client *kgo.Client
 }
 
-func New(cfg config.Config) (*Producer, error) {
+func NewProducer(cfg Config) (*Producer, error) {
 	if err := cfg.ValidateProducer(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+		return nil, fmt.Errorf("producer: %w", err)
 	}
 
 	client, err := kgo.NewClient(cfg.ProducerOpts()...)
 	if err != nil {
-		return nil, fmt.Errorf("new kgo client: %w", err)
+		return nil, fmt.Errorf("producer client: %w", err)
 	}
 
-	return &Producer{client: client}, nil
+	return &Producer{
+		client: client,
+	}, nil
 }
 
-func Publish[T any](ctx context.Context, p *Producer, topic string, ev envelope.Envelope[T]) error {
-	var value []byte
-	var err error
+func (p *Producer) Produce(parentCtx context.Context, record *kgo.Record) {
+	// Убираем возможность отмены, чтоб не обрубать отправку записи при shutdown
+	// То, что мы не зависнем гарантирует RecordDeliveryTimeout, который обязательно выставлять
+	ctx := context.WithoutCancel(parentCtx)
 
-	if ev.Op == envelope.OpDelete {
-		value = nil
-	} else {
-		value, err = ev.Encode()
+	p.client.Produce(ctx, record, func(r *kgo.Record, err error) {
 		if err != nil {
-			return fmt.Errorf("encode envelope: %w", err)
+			slog.LogAttrs(ctx, slog.LevelError, "producer: record delivery failed",
+				slog.String("topic", r.Topic),
+				slog.String("key", string(r.Key)),
+				slog.Any("error", err),
+			)
+			return
 		}
-	}
 
-	record := &kgo.Record{
-		Topic: topic,
-		Key:   []byte(ev.EntityID),
-		Value: value,
-		Headers: []kgo.RecordHeader{
-			{Key: envelope.EnvelopeType, Value: []byte(ev.EntityType)},
-			{Key: envelope.TraceId, Value: []byte(ev.TraceID)},
-		},
-	}
-
-	resultCh := make(chan error, 1)
-	p.client.Produce(ctx, record, func(_ *kgo.Record, err error) {
-		resultCh <- err
+		slog.LogAttrs(ctx, slog.LevelDebug, "producer: record delivered",
+			slog.String("topic", r.Topic),
+			slog.Int("partition", int(r.Partition)),
+			slog.Int64("offset", r.Offset),
+		)
 	})
-
-	select {
-	case err := <-resultCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
-// Flush ждёт подтверждения брокером всех записей из буфера.
-// Возвращает ctx.Err(), если ожидание отменили.
+// Блокируется пока не обработаются все записи из буффера
+// или не отменится контекст
 func (p *Producer) Flush(ctx context.Context) error {
-	return p.client.Flush(ctx)
-}
-
-// Shutdown — штатная остановка: дожидается доставки буфера и закрывает клиента.
-// Ограничивается переданным контекстом; клиент закрывается в любом случае.
-func (p *Producer) Shutdown(ctx context.Context) error {
-	defer p.Close()
-
 	if err := p.client.Flush(ctx); err != nil {
-		return fmt.Errorf("producer: flush: %w", err)
+		return fmt.Errorf("flush: %w", err)
 	}
 	return nil
 }
 
-// Close закрывает клиента немедленно, недоставленные записи теряются.
-// Идемпотентен, поэтому годится для defer рядом с Shutdown.
-func (p *Producer) Close() {
-	p.closeOnce.Do(p.client.Close)
+// Вызывает [Flush] чтоб гарантировать обработку всех событий в памяти
+func (p *Producer) Close(ctx context.Context) error {
+	defer p.client.Close()
+	
+	if err := p.Flush(ctx); err != nil {
+		return fmt.Errorf("close: %w", err)
+	}
+
+	return nil
 }

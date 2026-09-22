@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+const (
+	ENVELOPE_TYPE string = "evelope_type"
+	TRACE_ID string = "trace_id"
+)
+
+// Type of operation
 type Op string
 
 const (
@@ -15,7 +21,7 @@ const (
 	OpRead   Op = "r" // read
 )
 
-// Basic type of Event 
+// Envelope for event 
 type Envelope[T any] struct {
 	EntityType string    `json:"entity_type"`
 	EntityID   string    `json:"entity_id"`   
@@ -43,6 +49,7 @@ func New[T any](entityType, entityID string, version int64, op Op, payload *T) E
 	}
 }
 
+// Json Encode
 func (e Envelope[T]) Encode() ([]byte, error) {
 	const op = "Envelope.Encode"
 	
@@ -54,6 +61,7 @@ func (e Envelope[T]) Encode() ([]byte, error) {
 	return raw, nil
 }
 
+// Json Decode
 func (e Envelope[T]) Decode(v []byte) (Envelope[T], error) {
 	const op = "Envelope.Decode"
 
