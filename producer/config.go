@@ -6,16 +6,57 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/giicoo/ecst-go/backoff"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 	"github.com/twmb/franz-go/plugin/kslog"
 )
 
+// Сколько подтверждений записи ждать от брокера
+type Acks string
+
+const (
+	// Все ISR-реплики. Единственный вариант, при котором работает идемпотентность
+	AcksAll Acks = "all"
+
+	// Только лидер партиции: быстрее, но запись теряется при его падении
+	AcksLeader Acks = "leader"
+
+	// Не ждем подтверждения вообще: fire-and-forget
+	AcksNone Acks = "none"
+)
+
+// Кодек сжатия батчей
+type Compression string
+
+const (
+	CompressionNone   Compression = "none"
+	CompressionGzip   Compression = "gzip"
+	CompressionSnappy Compression = "snappy"
+	CompressionLz4    Compression = "lz4"
+	CompressionZstd   Compression = "zstd"
+)
+
+func (c Compression) codec() (kgo.CompressionCodec, bool) {
+	switch c {
+	case CompressionNone:
+		return kgo.NoCompression(), true
+	case CompressionGzip:
+		return kgo.GzipCompression(), true
+	case CompressionSnappy:
+		return kgo.SnappyCompression(), true
+	case CompressionLz4:
+		return kgo.Lz4Compression(), true
+	case CompressionZstd:
+		return kgo.ZstdCompression(), true
+	}
+	return kgo.CompressionCodec{}, false
+}
+
 type Config struct {
 	// Bootstrap servers
 	Brokers  []string
 	ClientID string
-
 
 	//////////////
 	// SECURITY //
@@ -24,30 +65,39 @@ type Config struct {
 	SASLPass string
 	TLS      *tls.Config
 
-
 	/////////////////
 	// RELIABILITY //
 	/////////////////
-	
-	// Общее время "жизни" записи (сумма всех ретраев) 
+
+	// Сколько подтверждений ждать от брокера
+	Acks Acks
+
+	// Задержка между повторными попытками отправки
+	Backoff backoff.Config
+
+	// Общее время "жизни" записи (сумма всех ретраев)
 	RecordDeliveryTimeout time.Duration
 
 	// Время ожидание ACKS от брокера
-	ProduceRequestTimeout time.Duration 
+	ProduceRequestTimeout time.Duration
 
 	// Время на подключение к брокеру
-	DialTimeout           time.Duration
+	DialTimeout time.Duration
 
-	
 	////////////
 	// MEMORY //
 	////////////
 
 	// Время наполения батча до его отправки
-	Linger        time.Duration
+	Linger time.Duration
 
 	// Максимальный размер батча (отправляется при достижении)
 	BatchMaxBytes int32
+
+	// Кодеки сжатия батчей в порядке предпочтения:
+	// брокер выберет первый, который поддерживает.
+	// Пустой список - без сжатия
+	Compression []Compression
 
 	// Буффер - место в памяти куда складываются записи
 	// после Produce, пока брокер недоступен
@@ -56,8 +106,7 @@ type Config struct {
 	MaxBufferedRecords int
 
 	// Максимальный объем буффера клиента
-	MaxBufferedBytes   int
-
+	MaxBufferedBytes int
 }
 
 // DefaultConfig возвращает конфиг с разумными значениями по умолчанию.
@@ -67,12 +116,16 @@ func DefaultConfig(brokers ...string) Config {
 		Brokers:  brokers,
 		ClientID: "ecst-producer",
 
+		Acks:    AcksAll,
+		Backoff: backoff.Default(),
+
 		RecordDeliveryTimeout: 15 * time.Second,
 		ProduceRequestTimeout: 5 * time.Second,
 		DialTimeout:           5 * time.Second,
 
 		Linger:        2 * time.Millisecond,
 		BatchMaxBytes: 1 << 20, // 1 MiB, не больше message.max.bytes на брокере
+		Compression:   []Compression{CompressionZstd, CompressionSnappy},
 
 		MaxBufferedRecords: 50_000,
 		MaxBufferedBytes:   256 << 20, // 256 MiB
@@ -86,6 +139,24 @@ func (c Config) ValidateProducer() error {
 
 	if len(c.Brokers) == 0 {
 		add("brokers are required")
+	}
+
+	switch c.Acks {
+	case AcksAll, AcksLeader, AcksNone:
+	case "":
+		add("Acks is required")
+	default:
+		add("unknown Acks: " + string(c.Acks))
+	}
+
+	if err := c.Backoff.Validate(); err != nil {
+		errs = append(errs, err)
+	}
+
+	for _, comp := range c.Compression {
+		if _, ok := comp.codec(); !ok {
+			add("unknown Compression: " + string(comp))
+		}
 	}
 
 	// Без RecordDeliveryTimeout запись ретраится вечно, поэтому он обязателен
@@ -133,22 +204,34 @@ func (c Config) ProducerOpts() []kgo.Opt {
 		kgo.ClientID(c.ClientID),
 		kgo.DialTimeout(c.DialTimeout),
 
-		// Значение по умолчанию: Ждем подтверждение вес реплик
-		kgo.RequiredAcks(kgo.AllISRAcks()),
-
 		kgo.RecordDeliveryTimeout(c.RecordDeliveryTimeout),
 		kgo.ProduceRequestTimeout(c.ProduceRequestTimeout),
+
+		// Экспоненциальная задержка с джиттером между ретраями
+		kgo.RetryBackoffFn(func(tries int) time.Duration {
+			return c.Backoff.Delay(tries)
+		}),
 
 		// Батчинг и сжатие
 		kgo.ProducerLinger(c.Linger),
 		kgo.ProducerBatchMaxBytes(c.BatchMaxBytes),
-		kgo.ProducerBatchCompression(kgo.ZstdCompression(), kgo.SnappyCompression()),
+		kgo.ProducerBatchCompression(c.codecs()...),
 
 		// Backpressure: при заполнении буфера Produce блокируется
 		kgo.MaxBufferedRecords(c.MaxBufferedRecords),
 		kgo.MaxBufferedBytes(c.MaxBufferedBytes),
 
 		kgo.WithLogger(kslog.New(slog.Default())),
+	}
+
+	switch c.Acks {
+	case AcksLeader:
+		// Идемпотентность требует acks=all, иначе kgo.NewClient вернет ошибку
+		opts = append(opts, kgo.RequiredAcks(kgo.LeaderAck()), kgo.DisableIdempotentWrite())
+	case AcksNone:
+		opts = append(opts, kgo.RequiredAcks(kgo.NoAck()), kgo.DisableIdempotentWrite())
+	default:
+		opts = append(opts, kgo.RequiredAcks(kgo.AllISRAcks()))
 	}
 
 	if c.TLS != nil {
@@ -163,31 +246,19 @@ func (c Config) ProducerOpts() []kgo.Opt {
 	return opts
 }
 
-// Дефолтный конфиг
-func (c Config) WithProducerDefaults() Config {
-	if c.ClientID == "" {
-		c.ClientID = "ecst-producer"
+// Перевод [Config.Compression] в кодеки kgo
+func (c Config) codecs() []kgo.CompressionCodec {
+	codecs := make([]kgo.CompressionCodec, 0, len(c.Compression))
+
+	for _, comp := range c.Compression {
+		if codec, ok := comp.codec(); ok {
+			codecs = append(codecs, codec)
+		}
 	}
-	if c.RecordDeliveryTimeout == 0 {
-		c.RecordDeliveryTimeout = 15 * time.Second
+
+	if len(codecs) == 0 {
+		codecs = append(codecs, kgo.NoCompression())
 	}
-	if c.ProduceRequestTimeout == 0 {
-		c.ProduceRequestTimeout = 5 * time.Second
-	}
-	if c.DialTimeout == 0 {
-		c.DialTimeout = 5 * time.Second
-	}
-	if c.Linger == 0 {
-		c.Linger = 2 * time.Millisecond
-	}
-	if c.BatchMaxBytes == 0 {
-		c.BatchMaxBytes = 1 << 20 
-	}
-	if c.MaxBufferedRecords == 0 {
-		c.MaxBufferedRecords = 50_000
-	}
-	if c.MaxBufferedBytes == 0 {
-		c.MaxBufferedBytes = 256 << 20 // 256 MiB
-	}
-	return c
+
+	return codecs
 }
