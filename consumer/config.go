@@ -70,8 +70,10 @@ type Config struct {
 	// 1 - без повторов
 	HandlerMaxAttempts int
 
-	// Куда отправлять записи, которые обработать не удалось.
-	// nil - DLQ выключен: ошибка обработки останавливает консьюмера.
+	// Куда отправлять записи, которые обработать не удалось. Обязательна:
+	// без нее необработанную запись некуда деть, и она встанет поперек своей
+	// партиции намертво - ребаланс и рестарт приведут нового владельца
+	// к той же записи.
 	//
 	// Закрывает DLQ тот, кто ее создал: консьюмер этого не делает
 	DLQ DLQ
@@ -106,7 +108,7 @@ type Config struct {
 }
 
 // DefaultConfig возвращает конфиг с разумными значениями по умолчанию.
-// Group и Topics обязательны, их выставляют полями после вызова.
+// Group, Topics и DLQ обязательны, их выставляют полями после вызова.
 func DefaultConfig(brokers ...string) Config {
 	return Config{
 		Brokers:  brokers,
@@ -155,7 +157,10 @@ func (c Config) ValidateConsumer() error {
 	if c.HandlerMaxAttempts <= 0 {
 		add("HandlerMaxAttempts must be > 0")
 	}
-	if c.DLQ != nil && c.DLQMaxAttempts <= 0 {
+	if c.DLQ == nil {
+		add("DLQ is required")
+	}
+	if c.DLQMaxAttempts <= 0 {
 		add("DLQMaxAttempts must be > 0")
 	}
 

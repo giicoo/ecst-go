@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -22,8 +23,8 @@ func (f *fakeDLQ) Send(context.Context, *kgo.Record, error) error {
 	return f.err
 }
 
-// testConsumer собирает консьюмера без kgo-клиента: handle его не трогает
-func testConsumer(t *testing.T, dlq DLQ, handler Handler) *Consumer {
+// testProcessor собирает обработчик записей без kgo-клиента: он ему не нужен
+func testProcessor(t *testing.T, dlq DLQ, handler Handler) *processor {
 	t.Helper()
 
 	cfg := DefaultConfig("localhost:9092")
@@ -36,7 +37,7 @@ func testConsumer(t *testing.T, dlq DLQ, handler Handler) *Consumer {
 		t.Fatalf("validate: %v", err)
 	}
 
-	return &Consumer{cfg: cfg, handler: handler}
+	return newProcessor(cfg, handler, slog.Default())
 }
 
 func record() *kgo.Record {
@@ -47,16 +48,16 @@ func TestHandleRetriesThenDLQ(t *testing.T) {
 	dlq := &fakeDLQ{}
 	calls := 0
 
-	c := testConsumer(t, dlq, func(context.Context, *kgo.Record) error {
+	p := testProcessor(t, dlq, func(context.Context, *kgo.Record) error {
 		calls++
 		return errors.New("boom")
 	})
 
-	if err := c.handle(context.Background(), record()); err != nil {
+	if err := p.process(context.Background(), record()); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
-	if calls != c.cfg.HandlerMaxAttempts {
-		t.Fatalf("handler calls = %d, want %d", calls, c.cfg.HandlerMaxAttempts)
+	if calls != p.cfg.HandlerMaxAttempts {
+		t.Fatalf("handler calls = %d, want %d", calls, p.cfg.HandlerMaxAttempts)
 	}
 	if dlq.calls != 1 {
 		t.Fatalf("dlq calls = %d, want 1", dlq.calls)
@@ -67,12 +68,12 @@ func TestHandlePermanentGoesStraightToDLQ(t *testing.T) {
 	dlq := &fakeDLQ{}
 	calls := 0
 
-	c := testConsumer(t, dlq, func(context.Context, *kgo.Record) error {
+	p := testProcessor(t, dlq, func(context.Context, *kgo.Record) error {
 		calls++
 		return fmt.Errorf("parse: %w", ErrPermanent)
 	})
 
-	if err := c.handle(context.Background(), record()); err != nil {
+	if err := p.process(context.Background(), record()); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if calls != 1 {
@@ -87,14 +88,14 @@ func TestHandleDLQFailureStopsConsumer(t *testing.T) {
 	dlq := &fakeDLQ{err: errors.New("broker down")}
 	cause := errors.New("boom")
 
-	c := testConsumer(t, dlq, func(context.Context, *kgo.Record) error { return cause })
+	p := testProcessor(t, dlq, func(context.Context, *kgo.Record) error { return cause })
 
-	err := c.handle(context.Background(), record())
+	err := p.process(context.Background(), record())
 	if err == nil {
 		t.Fatal("handle: want error")
 	}
-	if dlq.calls != c.cfg.DLQMaxAttempts {
-		t.Fatalf("dlq calls = %d, want %d", dlq.calls, c.cfg.DLQMaxAttempts)
+	if dlq.calls != p.cfg.DLQMaxAttempts {
+		t.Fatalf("dlq calls = %d, want %d", dlq.calls, p.cfg.DLQMaxAttempts)
 	}
 	// Причина исходного сбоя не теряется - она нужна, чтоб понять, что чинить
 	if !errors.Is(err, cause) {
@@ -102,11 +103,15 @@ func TestHandleDLQFailureStopsConsumer(t *testing.T) {
 	}
 }
 
-func TestHandleWithoutDLQStops(t *testing.T) {
-	c := testConsumer(t, nil, func(context.Context, *kgo.Record) error { return errors.New("boom") })
+// Без DLQ девать необработанную запись некуда, и она встала бы поперек
+// своей партиции навсегда, поэтому конфиг без DLQ не проходит валидацию
+func TestConfigRequiresDLQ(t *testing.T) {
+	cfg := DefaultConfig("localhost:9092")
+	cfg.Group = "g"
+	cfg.Topics = []string{"t"}
 
-	if err := c.handle(context.Background(), record()); err == nil {
-		t.Fatal("handle: want error")
+	if err := cfg.ValidateConsumer(); err == nil {
+		t.Fatal("want error on nil DLQ")
 	}
 }
 

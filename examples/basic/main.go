@@ -13,9 +13,10 @@ import (
 )
 
 const (
-	broker = "localhost:9092"
-	topic  = "orders"
-	group  = "ecst-example"
+	broker   = "localhost:9092"
+	topic    = "orders"
+	dlqTopic = "orders.dlq"
+	group    = "ecst-example"
 )
 
 func main() {
@@ -23,24 +24,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := produce(ctx); err != nil {
-		fmt.Println("produce:", err)
-		os.Exit(1)
-	}
-
-	if err := consume(ctx); err != nil {
-		fmt.Println("consume:", err)
+	if err := run(ctx); err != nil {
+		fmt.Println("run:", err)
 		os.Exit(1)
 	}
 }
 
-func produce(ctx context.Context) error {
+func run(ctx context.Context) error {
 	p, err := producer.NewProducer(producer.DefaultConfig(broker))
 	if err != nil {
 		return err
 	}
-	// Close флашит буффер, поэтому контекст без отмены.
-	// Зависнуть не даст RecordDeliveryTimeout
+	// Тот же продюсер пишет и в DLQ, поэтому закрывается последним.
+	// Close флашит буффер, поэтому контекст без отмены:
+	// зависнуть не даст RecordDeliveryTimeout
 	defer p.Close(context.WithoutCancel(ctx))
 
 	p.Produce(ctx, &kgo.Record{
@@ -49,13 +46,21 @@ func produce(ctx context.Context) error {
 		Value: []byte("hello world"),
 	})
 
-	return nil
+	return consume(ctx, p)
 }
 
-func consume(ctx context.Context) error {
+func consume(ctx context.Context, p *producer.Producer) error {
+	// DLQ обязательна: без нее запись, которую не удалось обработать,
+	// встала бы поперек своей партиции
+	dlq, err := consumer.NewKafkaDLQ(p, dlqTopic)
+	if err != nil {
+		return err
+	}
+
 	cfg := consumer.DefaultConfig(broker)
 	cfg.Group = group
 	cfg.Topics = []string{topic}
+	cfg.DLQ = dlq
 
 	c, err := consumer.NewConsumer(cfg, printRecord)
 	if err != nil {
