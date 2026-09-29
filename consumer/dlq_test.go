@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,15 +13,29 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// fakeDLQ считает отправки и умеет падать
+// fakeDLQ считает отправки и умеет падать.
+//
+// В тестах пула в него пишут сразу несколько воркеров, поэтому под мьютексом
 type fakeDLQ struct {
+	mu    sync.Mutex
 	calls int
 	err   error
 }
 
 func (f *fakeDLQ) Send(context.Context, *kgo.Record, error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.calls++
+
 	return f.err
+}
+
+func (f *fakeDLQ) load() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.calls
 }
 
 // testProcessor собирает обработчик записей без kgo-клиента: он ему не нужен
@@ -59,8 +74,8 @@ func TestHandleRetriesThenDLQ(t *testing.T) {
 	if calls != p.cfg.HandlerMaxAttempts {
 		t.Fatalf("handler calls = %d, want %d", calls, p.cfg.HandlerMaxAttempts)
 	}
-	if dlq.calls != 1 {
-		t.Fatalf("dlq calls = %d, want 1", dlq.calls)
+	if dlq.load() != 1 {
+		t.Fatalf("dlq calls = %d, want 1", dlq.load())
 	}
 }
 
@@ -79,8 +94,8 @@ func TestHandlePermanentGoesStraightToDLQ(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("handler calls = %d, want 1", calls)
 	}
-	if dlq.calls != 1 {
-		t.Fatalf("dlq calls = %d, want 1", dlq.calls)
+	if dlq.load() != 1 {
+		t.Fatalf("dlq calls = %d, want 1", dlq.load())
 	}
 }
 
@@ -94,8 +109,8 @@ func TestHandleDLQFailureStopsConsumer(t *testing.T) {
 	if err == nil {
 		t.Fatal("handle: want error")
 	}
-	if dlq.calls != p.cfg.DLQMaxAttempts {
-		t.Fatalf("dlq calls = %d, want %d", dlq.calls, p.cfg.DLQMaxAttempts)
+	if dlq.load() != p.cfg.DLQMaxAttempts {
+		t.Fatalf("dlq calls = %d, want %d", dlq.load(), p.cfg.DLQMaxAttempts)
 	}
 	// Причина исходного сбоя не теряется - она нужна, чтоб понять, что чинить
 	if !errors.Is(err, cause) {
