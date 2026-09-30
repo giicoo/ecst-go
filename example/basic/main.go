@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/giicoo/ecst-go/consumer"
 	"github.com/giicoo/ecst-go/producer"
@@ -17,6 +18,9 @@ const (
 	topic    = "orders"
 	dlqTopic = "orders.dlq"
 	group    = "ecst-example"
+
+	// Сколько ждать флаша буфера на закрытие продюсера
+	closeTimeout = 30 * time.Second
 )
 
 func main() {
@@ -36,9 +40,16 @@ func run(ctx context.Context) error {
 		return err
 	}
 	// Тот же продюсер пишет и в DLQ, поэтому закрывается последним.
-	// Close флашит буффер, поэтому контекст без отмены:
-	// зависнуть не даст RecordDeliveryTimeout
-	defer p.Close(context.WithoutCancel(ctx))
+	// Close флашит буффер, поэтому контекст без отмены, но с таймаутом:
+	// на недоступном брокере иначе висли бы вечно
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+		defer cancel()
+
+		if err := p.Close(closeCtx); err != nil {
+			fmt.Println("close producer:", err)
+		}
+	}()
 
 	p.Produce(ctx, &kgo.Record{
 		Topic: topic,
@@ -68,7 +79,9 @@ func consume(ctx context.Context, p *producer.Producer) error {
 	}
 	defer c.Close()
 
-	return c.Run(ctx)
+	c.Run(ctx)
+
+	return nil
 }
 
 func printRecord(_ context.Context, r *kgo.Record) error {

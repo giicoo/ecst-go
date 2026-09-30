@@ -71,14 +71,11 @@ func NewConsumer(cfg Config, handler Handler) (*Consumer, error) {
 // Run блокируется и читает записи, пока не отменят ctx или не закроют клиент.
 //
 // Ошибку не возвращает: сбой обработки останавливает только свою партицию,
-// а не консьюмера целиком (см. [Handler]). error в сигнатуре оставлен
-// на будущее и ради вызова вида "return c.Run(ctx)"
-func (c *Consumer) Run(ctx context.Context) error {
+// а не консьюмера целиком (см. [Handler]).
+func (c *Consumer) Run(ctx context.Context) {
 	c.split.poll(ctx, c.client)
 
 	slog.LogAttrs(ctx, slog.LevelInfo, "consumer: stopped", slog.Any("reason", ctx.Err()))
-
-	return nil
 }
 
 // Закрывает клиент и выходит из группы, чтоб партиции сразу разъехались

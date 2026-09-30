@@ -2,6 +2,7 @@ package envelope
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -14,6 +15,19 @@ const (
 
 // Type of operation
 type Op string
+
+func (o Op) known() bool {
+	switch o {
+	case OpCreate, OpUpdate, OpDelete, OpRead:
+		return true
+	}
+
+	return false
+}
+
+// hasPayload tells whether the operation must carry a payload.
+// Delete only states the entity is gone, its state is no longer meaningful
+func (o Op) hasPayload() bool { return o != OpDelete }
 
 const (
 	OpCreate Op = "c" // create
@@ -66,9 +80,77 @@ func (e Envelope[T]) WithTraceID(traceID string) Envelope[T] {
 	return e
 }
 
-// Json Encode
+// Validate reports every problem at once.
+//
+// An event without EntityType, EntityID, Version or Source cannot be routed
+// or read by a consumer, so it must never reach the broker
+func (e Envelope[T]) Validate() error {
+	const op = "Envelope.Validate"
+
+	var errs []error
+	add := func(msg string) { errs = append(errs, fmt.Errorf("%s: %s", op, msg)) }
+
+	if e.EntityType == "" {
+		add("EntityType is required")
+	}
+
+	// EntityID is the partition key: without it the events of one entity
+	// scatter across partitions and lose their order
+	if e.EntityID == "" {
+		add("EntityID is required")
+	}
+
+	// Version lets the consumer drop events it has already applied
+	if e.Version <= 0 {
+		add("Version must be > 0")
+	}
+
+	switch {
+	case e.Op == "":
+		add("Op is required")
+	case !e.Op.known():
+		add("unknown Op: " + string(e.Op))
+	case e.Op.hasPayload() && e.Payload == nil:
+		add("Payload is required for Op " + string(e.Op))
+	}
+
+	// Without Source a consumer cannot tell who sent the event
+	// and by which schema to read its payload
+	if e.Source.Service == "" {
+		add("Source.Service is required")
+	}
+	if e.Source.SchemaVer == "" {
+		add("Source.SchemaVer is required")
+	}
+
+	if e.Timestamp.IsZero() {
+		add("Timestamp is required")
+	}
+
+	return errors.Join(errs...)
+}
+
+// Headers duplicates the routing fields of the envelope: with them a record
+// is filtered and traced without decoding its payload
+func (e Envelope[T]) Headers() map[string]string {
+	headers := map[string]string{
+		HeaderEnvelopeType: e.EntityType,
+	}
+	if e.TraceID != "" {
+		headers[HeaderTraceID] = e.TraceID
+	}
+
+	return headers
+}
+
+// Json Encode. Validates first: a broken envelope is cheaper to catch here
+// than in every consumer
 func (e Envelope[T]) Encode() ([]byte, error) {
 	const op = "Envelope.Encode"
+
+	if err := e.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
 
 	raw, err := json.Marshal(e)
 	if err != nil {
@@ -85,6 +167,12 @@ func Decode[T any](raw []byte) (Envelope[T], error) {
 	var e Envelope[T]
 
 	if err := json.Unmarshal(raw, &e); err != nil {
+		return e, fmt.Errorf("%s: %w", op, err)
+	}
+
+	// The producer may be older than this consumer, or another service
+	// entirely: what came off the wire is checked, not trusted
+	if err := e.Validate(); err != nil {
 		return e, fmt.Errorf("%s: %w", op, err)
 	}
 

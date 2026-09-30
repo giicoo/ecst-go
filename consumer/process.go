@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/giicoo/ecst-go/backoff"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -70,36 +71,22 @@ func (p *processor) process(ctx context.Context, r *kgo.Record) error {
 	return nil
 }
 
-// retry повторяет op с экспоненциальной задержкой.
-// Задержка нужна, чтоб не выжечь все попытки за миллисекунды,
-// пока лежит база или соседний сервис.
+// retry повторяет op, логируя каждую неудачную попытку.
 //
-// Прерывается сразу на [ErrPermanent] и на отмене ctx
+// Прерывается сразу на [ErrPermanent] и на отмене ctx - см. [backoff.Retry]
 func (p *processor) retry(ctx context.Context, attempts int, what string, r *kgo.Record, op func() error) error {
-	var err error
-
-	for attempt := 1; attempt <= attempts; attempt++ {
-		if err = op(); err == nil {
-			return nil
-		}
-
-		if errors.Is(err, ErrPermanent) || attempt == attempts {
-			break
-		}
-
-		p.log.LogAttrs(ctx, slog.LevelWarn, "consumer: "+what+" failed, retrying",
-			slog.String("topic", r.Topic),
-			slog.Int("partition", int(r.Partition)),
-			slog.Int64("offset", r.Offset),
-			slog.Int("attempt", attempt),
-			slog.Any("error", err),
-		)
-
-		// Отмена ctx во время ожидания - штатная остановка
-		if waitErr := p.cfg.Backoff.Wait(ctx, attempt); waitErr != nil {
-			return errors.Join(err, waitErr)
-		}
-	}
-
-	return err
+	return backoff.Retry{
+		Config:    p.cfg.Backoff,
+		Attempts:  attempts,
+		Permanent: func(err error) bool { return errors.Is(err, ErrPermanent) },
+		OnRetry: func(attempt int, err error) {
+			p.log.LogAttrs(ctx, slog.LevelWarn, "consumer: "+what+" failed, retrying",
+				slog.String("topic", r.Topic),
+				slog.Int("partition", int(r.Partition)),
+				slog.Int64("offset", r.Offset),
+				slog.Int("attempt", attempt),
+				slog.Any("error", err),
+			)
+		},
+	}.Do(ctx, op)
 }

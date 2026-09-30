@@ -149,9 +149,7 @@ func runConsumer(t *testing.T, cfg Config, handler Handler) *Consumer {
 
 	go func() {
 		defer close(done)
-		if err := c.Run(ctx); err != nil {
-			t.Errorf("run: %v", err)
-		}
+		c.Run(ctx)
 	}()
 
 	t.Cleanup(func() {
