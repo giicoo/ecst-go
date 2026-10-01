@@ -2,9 +2,11 @@ package producer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -61,6 +63,47 @@ func (p *Producer) ProduceSync(ctx context.Context, records ...*kgo.Record) erro
 	}
 
 	return nil
+}
+
+// Result - что стало с одной записью в [Producer.ProduceSyncResults]
+type Result struct {
+	Record *kgo.Record
+
+	// nil, если запись сохранена брокером
+	Err error
+}
+
+// ProduceSyncResults блокируется до подтверждения всех записей и возвращает
+// результат по каждой.
+//
+// В отличие от [Producer.ProduceSync] не сводит батч к первой ошибке:
+// одна незаписанная запись не делает неизвестной судьбу остальных.
+// Нужен там, где по каждой записи свое решение - например в outbox-таблице,
+// где отмечать отправленными надо только доехавшие строки.
+//
+// Порядок результатов не совпадает с порядком аргументов: записи
+// подтверждаются вразнобой, поэтому свою запись ищут по Result.Record
+func (p *Producer) ProduceSyncResults(ctx context.Context, records ...*kgo.Record) []Result {
+	produced := p.client.ProduceSync(ctx, records...)
+
+	results := make([]Result, 0, len(produced))
+	for _, r := range produced {
+		results = append(results, Result{Record: r.Record, Err: r.Err})
+	}
+
+	return results
+}
+
+// Permanent сообщает, что запись не доедет и на повторе: брокер отверг ее
+// саму, а не отказался ее сейчас принять.
+//
+// Такое дает MESSAGE_TOO_LARGE, INVALID_RECORD, отказ авторизации.
+// Таймауты, недоступный брокер и неизвестный пока топик - не сюда:
+// они лечатся повтором
+func Permanent(err error) bool {
+	var kerror *kerr.Error
+
+	return errors.As(err, &kerror) && !kerr.IsRetriable(err)
 }
 
 // Блокируется пока не обработаются все записи из буффера

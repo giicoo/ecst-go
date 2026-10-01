@@ -129,8 +129,10 @@ func (w *outboxWorker) processBatch(parentCtx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// Строка ищется по своей записи: результаты отправки приезжают вразнобой
+	rows := make(map[*kgo.Record]string, len(msgs))
 	records := make([]*kgo.Record, 0, len(msgs))
-	ids := make([]string, 0, len(msgs))
+
 	for _, m := range msgs {
 		rec, err := m.record()
 		if err != nil {
@@ -142,37 +144,76 @@ func (w *outboxWorker) processBatch(parentCtx context.Context) (int, error) {
 			continue
 		}
 
+		rows[rec] = m.ID
 		records = append(records, rec)
-		ids = append(ids, m.ID)
 	}
 
 	if len(records) == 0 {
 		return 0, nil
 	}
 
-	// Синхронно: отметить строки отправленными можно только после
-	// подтверждения брокером, иначе события теряются молча
-	if err := w.p.ProduceSync(ctx, records...); err != nil {
-		return 0, fmt.Errorf("outbox: produce: %w", err)
+	// Синхронно и по каждой записи отдельно: отметить строку отправленной
+	// можно только после подтверждения брокером, а судьба у записей разная -
+	// сводить батч к первой ошибке значило бы перепубликовывать доехавшие
+	ids, failed := w.publish(ctx, rows, records)
+
+	if len(ids) > 0 {
+		// Отметка не отменяется вместе с ctx: неотмеченные строки поедут
+		// в Kafka повторно, а это дубли на стороне потребителя
+		markCtx, markCancel := context.WithTimeout(context.WithoutCancel(parentCtx), w.cfg.BatchTimeout)
+		defer markCancel()
+
+		// Ретраи здесь особенно важны: незакоммиченная отметка - это дубли
+		// на стороне потребителя, а не просто отложенный цикл
+		markErr := w.retry(markCtx, "mark sent", func() error {
+			return w.cfg.Store.MarkSent(markCtx, ids)
+		})
+		if markErr != nil {
+			return len(ids), fmt.Errorf("outbox: mark sent: %w", markErr)
+		}
+
+		w.log.LogAttrs(ctx, slog.LevelDebug, "outbox: batch published", slog.Int("count", len(ids)))
 	}
 
-	// Отметка не отменяется вместе с ctx: неотмеченные строки поедут
-	// в Kafka повторно, а это дубли на стороне потребителя
-	markCtx, markCancel := context.WithTimeout(context.WithoutCancel(parentCtx), w.cfg.BatchTimeout)
-	defer markCancel()
-
-	// Ретраи здесь особенно важны: незакоммиченная отметка - это дубли
-	// на стороне потребителя, а не просто отложенный цикл
-	markErr := w.retry(markCtx, "mark sent", func() error {
-		return w.cfg.Store.MarkSent(markCtx, ids)
-	})
-	if markErr != nil {
-		return len(records), fmt.Errorf("outbox: mark sent: %w", markErr)
+	// Строки, которые не доехали по преходящей причине, остались
+	// неотмеченными и приедут в следующем заходе
+	if failed > 0 {
+		return len(ids), fmt.Errorf("outbox: %d of %d records not delivered", failed, len(records))
 	}
 
-	w.log.LogAttrs(ctx, slog.LevelDebug, "outbox: batch published", slog.Int("count", len(records)))
+	return len(ids), nil
+}
 
-	return len(records), nil
+// publish публикует записи и разбирает результат по каждой.
+//
+// Возвращает id доехавших строк и число тех, которые стоит попробовать снова.
+// Строки, которые брокер отверг окончательно, уезжают в MarkFailed:
+// повтор их не вылечит
+func (w *outboxWorker) publish(ctx context.Context, rows map[*kgo.Record]string, records []*kgo.Record) (ids []string, failed int) {
+	ids = make([]string, 0, len(records))
+
+	for _, res := range w.p.ProduceSyncResults(ctx, records...) {
+		id := rows[res.Record]
+
+		switch {
+		case res.Err == nil:
+			ids = append(ids, id)
+
+		case producer.Permanent(res.Err):
+			w.markFailed(ctx, id, fmt.Errorf("outbox: produce: %w", res.Err))
+
+		default:
+			failed++
+
+			w.log.LogAttrs(ctx, slog.LevelError, "outbox: record not delivered",
+				slog.String("id", id),
+				slog.String("topic", res.Record.Topic),
+				slog.Any("error", res.Err),
+			)
+		}
+	}
+
+	return ids, failed
 }
 
 // record собирает запись из конверта.

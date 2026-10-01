@@ -1,7 +1,18 @@
 // Пример ECST-сервиса: события пишутся в outbox-таблицу, оттуда уезжают
 // в Kafka и возвращаются в inbox-хендлеры этого же сервиса.
 //
-// Нужен запущенный брокер: docker compose up -d
+// Нужен запущенный брокер и созданные топики:
+//
+//	docker compose up -d
+//	docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+//		--bootstrap-server localhost:9092 --create --if-not-exists \
+//		--topic orders --partitions 3
+//	docker compose exec broker /opt/kafka/bin/kafka-topics.sh \
+//		--bootstrap-server localhost:9092 --create --if-not-exists \
+//		--topic users --partitions 3
+//
+// Топики нужны заранее: автосоздание у брокера выключено, а без топика
+// ProduceSync роняет весь батч, и вместе с ним - строки, которым топик есть
 package main
 
 import (
@@ -50,7 +61,7 @@ func run(ctx context.Context) error {
 	defer svc.Close(ctx)
 
 	// Бизнес-логика: пишет события в свою БД, про Kafka ничего не знает
-	go emitOrders(ctx, store)
+	go emitEvents(ctx, store)
 
 	svc.Run(ctx)
 

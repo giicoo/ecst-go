@@ -26,15 +26,17 @@ type User struct {
 	Email string `json:"email"`
 }
 
-// emitOrders изображает бизнес-логику: пишет события в outbox-таблицу,
+// emitEvents изображает бизнес-логику: пишет события в outbox-таблицу,
 // пока не отменят ctx.
 //
-// В боевом коде это делается той же транзакцией, что и изменение самого
-// заказа - в этом весь смысл outbox: событие и состояние коммитятся атомарно
-func emitOrders(ctx context.Context, store *memStore) {
+// В боевом коде это делается той же транзакцией, что и изменение самой
+// сущности - в этом весь смысл outbox: событие и состояние коммитятся атомарно
+func emitEvents(ctx context.Context, store *memStore) {
 	ticker := time.NewTicker(emitInterval)
 	defer ticker.Stop()
 
+	// Version растет с каждым изменением сущности: по ней получатель
+	// отбрасывает события, которые уже применил
 	for version := int64(1); ; version++ {
 		select {
 		case <-ctx.Done():
@@ -42,22 +44,37 @@ func emitOrders(ctx context.Context, store *memStore) {
 		case <-ticker.C:
 		}
 
-		// Version растет с каждым изменением сущности: по ней получатель
-		// отбрасывает события, которые уже применил
-		e := envelope.New("order", "order-1", version, envelope.OpUpdate, &Order{Sum: 100 * int(version)}).
+		order := envelope.New("order", "order-1", version, envelope.OpUpdate, &Order{Sum: 100 * int(version)}).
 			WithSource("orders-service", "v1").
 			WithTraceID(fmt.Sprintf("trace-%d", version))
 
-		// ID строки в таблице. В боевом коде его выдает БД
-		msg, err := ecst.NewOutboxMessage(fmt.Sprintf("row-%d", version), ordersTopic, e)
-		if err != nil {
-			slog.Error("build outbox message", "error", err)
+		add(store, fmt.Sprintf("order-row-%d", version), ordersTopic, order)
 
-			continue
+		// Каждое третье изменение пользователя - удаление: у него нет payload,
+		// потому что состояния у удаленной сущности не бывает
+		user := envelope.New("user", "user-1", version, envelope.OpUpdate, &User{
+			Email: fmt.Sprintf("user-1+v%d@example.com", version),
+		})
+		if version%3 == 0 {
+			user = envelope.New[User]("user", "user-1", version, envelope.OpDelete, nil)
 		}
 
-		store.Add(msg)
+		add(store, fmt.Sprintf("user-row-%d", version), usersTopic, user.WithSource("users-service", "v1"))
 	}
+}
+
+// add кладет событие в таблицу. Дженерик-функция, а не метод memStore:
+// тип payload у каждого события свой
+func add[T any](store *memStore, id, topic string, e envelope.Envelope[T]) {
+	// ID строки в таблице. В боевом коде его выдает БД
+	msg, err := ecst.NewOutboxMessage(id, topic, e)
+	if err != nil {
+		slog.Error("build outbox message", "id", id, "error", err)
+
+		return
+	}
+
+	store.Add(msg)
 }
 
 // handleOrder применяет событие заказа к своей копии данных.
@@ -82,9 +99,8 @@ func handleOrder(ctx context.Context, e envelope.Envelope[Order]) error {
 	return nil
 }
 
-// handleUser применяет событие пользователя.
-//
-// Топик наполняет другой сервис - здесь он только читается
+// handleUser применяет событие пользователя: у второго топика свой тип
+// payload и свой размер пула консьюмеров
 func handleUser(_ context.Context, e envelope.Envelope[User]) error {
 	// Delete приезжает без payload: состояния у удаленной сущности нет
 	if e.Op == envelope.OpDelete {
