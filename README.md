@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+    <img src="docs/assets/logo.png" alt="ecst-go" width="320">
+  </picture>
+</p>
+
 # ecst-go
 
 Библиотека для Event Carried State Transfer поверх Kafka ([franz-go](https://github.com/twmb/franz-go)).
