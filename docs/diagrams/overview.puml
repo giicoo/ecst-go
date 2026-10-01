@@ -1,47 +1,56 @@
 @startuml
 title ecst-go: компоненты и потоки
-left to right direction
 
-package "Ваш сервис" {
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+
+package "Ваш сервис: запись" as Write {
   [Бизнес-логика] as Biz
   database "БД сервиса\n+ outbox-таблица" as DB
-  [Handler] as H
-  database "БД-копия\nчужих сущностей" as Read
 }
 
-package "ecst.Service" {
-  package "Outbox" {
-    [outboxWorker] as OW
-    [producer.Producer\n(публикация)] as P1
-  }
-  package "Inbox" {
-    [inboxWorker] as IW
-    [пул consumer.Consumer\nна топик] as C
-    [producer.Producer\n(DLQ)] as P2
-  }
+package "ecst.Service — Outbox" as Out {
+  [outboxWorker] as OW
+  [producer.Producer\nпубликация] as P1
 }
 
-cloud Kafka {
+cloud "Kafka" as K {
   queue "orders" as T1
   queue "users" as T2
   queue "users.dlq" as D1
 }
 
-Biz --> DB : одна транзакция:\nUPDATE + INSERT outbox
-OW --> DB : Fetch / MarkSent / MarkFailed\n(OutboxStore)
-OW --> P1
-P1 --> T1 : ProduceSyncResults\nkey = entity_id
+package "ecst.Service — Inbox" as In {
+  [пул consumer.Consumer\nна топик] as C
+  [producer.Producer\nDLQ] as P2
+}
 
-T2 --> C : PollRecords
-IW --> C
-C --> H : envelope.Envelope[T]\n(декод в ecst.Topic)
-H --> Read : условный upsert по version
-C --> P2 : запись не пристроена
-P2 --> D1 : ProduceSync + dlq_* headers
+package "Ваш сервис: применение" as Apply {
+  [Handler] as H
+  database "БД-копия\nчужих сущностей" as Read
+}
 
-note bottom of P1
+Biz    --> DB : одна транзакция:\nUPDATE + INSERT outbox
+DB     --> OW : Fetch\n(FOR UPDATE SKIP LOCKED)
+OW     --> DB : MarkSent / MarkFailed
+OW     --> P1
+P1     --> T1 : ProduceSyncResults\nkey = entity_id
+
+T2     --> C  : PollRecords
+C      --> H  : envelope.Envelope[T]\n(декод в ecst.Topic)
+H      --> Read : условный upsert\nпо version
+C      --> P2 : запись не пристроена
+P2     --> D1 : ProduceSync\n+ dlq_* headers
+
+note right of Out
   У Outbox и Inbox свои продюсеры:
   поток публикации не должен занимать
   буфер, из которого пишется DLQ
+end note
+
+note right of Apply
+  Handler обязан быть идемпотентным:
+  at-least-once в обе стороны
 end note
 @enduml

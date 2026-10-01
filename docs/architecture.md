@@ -72,14 +72,42 @@ shutdown `ctx` уже отменен, и иначе недоотправленн
 
 ## Диаграммы
 
-- [`diagrams/overview.puml`](diagrams/overview.puml) — компоненты и потоки
-- [`diagrams/publish-consume.puml`](diagrams/publish-consume.puml) — retry publish / retry consume
-- [`diagrams/outbox-cycle.puml`](diagrams/outbox-cycle.puml) — один заход outbox-воркера
-- [`diagrams/consumer-pool.puml`](diagrams/consumer-pool.puml) — поллинг, воркеры, ребаланс
-- [`diagrams/shutdown.puml`](diagrams/shutdown.puml) — штатная остановка
+### Компоненты и потоки
 
-Рендер:
+![компоненты и потоки](diagrams/overview.svg)
+
+### Retry publish / retry consume
+
+Полный путь события со всеми ветками отказов — [`publish-consume.puml`](diagrams/publish-consume.puml):
+
+![retry publish / retry consume](diagrams/publish-consume.svg)
+
+### Один заход outbox-воркера
+
+![один заход outbox-воркера](diagrams/outbox-cycle.svg)
+
+### Поллинг, воркеры партиций, ребаланс
+
+![поллинг, воркеры, ребаланс](diagrams/consumer-pool.svg)
+
+### Штатная остановка
+
+![штатная остановка](diagrams/shutdown.svg)
+
+### Рендер
+
+Исходники — `.puml` рядом с картинками. Пересобрать после правки:
 
 ```bash
-plantuml docs/diagrams/*.puml
+cd docs/diagrams
+for f in *.puml; do
+  docker run --rm -i plantuml/plantuml -tsvg -charset UTF-8 -pipe < "$f" > "${f%.puml}.svg"
+done
+```
+
+Проверить синтаксис, ничего не перезаписывая:
+
+```bash
+docker run --rm -v "$PWD/docs/diagrams:/work:ro" -w /work \
+  plantuml/plantuml -checkonly -charset UTF-8 "*.puml"
 ```

@@ -3,6 +3,7 @@ title ecst-go: retry publish / retry consume
 hide footbox
 autonumber
 
+database "outbox-таблица" as Outbox
 participant "Outbox worker" as Producer
 box "Kafka" #F5F5F5
   queue "events" as Topic
@@ -10,7 +11,6 @@ box "Kafka" #F5F5F5
 end box
 participant "Inbox worker\n(воркер партиции)" as Consumer
 database "БД получателя" as DB
-database "outbox-таблица" as Outbox
 
 == Публикация ==
 

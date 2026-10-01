@@ -40,7 +40,9 @@ Go 1.27+.
 - [Inbox и обработка](docs/inbox.md)
 - [Гарантии доставки и отказы](docs/reliability.md)
 - [Конфигурация](docs/configuration.md)
-- [Диаграммы](docs/diagrams/)
+- [Диаграммы](docs/architecture.md#диаграммы)
+
+![компоненты и потоки](docs/diagrams/overview.svg)
 
 ---
 
@@ -274,3 +276,14 @@ Delete — это tombstone (`deleted = true` + версия), а не `DELETE F
 docker compose up -d
 go run ./example/ecst
 ```
+
+## Диаграммы
+
+Полный путь события со всеми ветками отказов:
+
+![retry publish / retry consume](docs/diagrams/publish-consume.svg)
+
+Остальные — [один заход outbox-воркера](docs/diagrams/outbox-cycle.svg),
+[поллинг и ребаланс](docs/diagrams/consumer-pool.svg),
+[штатная остановка](docs/diagrams/shutdown.svg). Исходники и команда рендера —
+в [docs/architecture.md](docs/architecture.md#диаграммы).
