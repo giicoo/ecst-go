@@ -1,0 +1,69 @@
+@startuml
+title ecst-go: поллинг, воркеры партиций, ребаланс
+hide footbox
+autonumber
+
+participant "poll loop\n(splitConsume)" as Poll
+participant "kgo.Client" as Cl
+participant "worker p0\n(pconsumer)" as W0
+participant "worker p1" as W1
+participant "handler" as H
+queue "DLQ" as DLQ
+
+== Назначение партиций ==
+Cl -> Poll : OnPartitionsAssigned({t: [0,1]})
+Poll -> Cl : ResumeFetchPartitions\n(могли остаться на паузе)
+Poll -> W0 : go consume(ctx)
+Poll -> W1 : go consume(ctx)
+
+== Нормальный цикл ==
+loop пока ctx жив
+  Poll -> Cl : PollRecords(MaxPollRecords)
+  note right of Poll : BlockRebalanceOnPoll:\nребаланс не начнется
+  Cl --> Poll : fetches
+
+  Poll -> W0 : recs <- батч p0
+  Poll -> W1 : recs <- батч p1
+  Poll -> Cl : AllowRebalance (defer)
+
+  W0 -> H : process(rec) по одной, по порядку
+  H --> W0 : ok
+  W0 -> Cl : CommitRecords(батч)\nctx без отмены, CommitTimeout
+end
+
+== Воркер встал ==
+W1 -> H : process(rec)
+H --> W1 : err
+W1 -> W1 : ретраи (HandlerMaxAttempts)
+W1 -> DLQ : Send
+DLQ --> W1 : err (DLQ недоступна)
+W1 -> W1 : close(failed), log ERROR\nбатч НЕ коммитится
+note right of W1
+  Коммитить дальше нельзя: CommitRecords
+  двигает офсет на максимум из батча
+  и перепрыгнул бы эту запись
+end note
+
+Poll -> Poll : dispatch видит <-failed
+Poll -> Cl : PauseFetchPartitions(t: [1])
+note right of Poll
+  ERROR "partition paused": сама не поедет -
+  ребаланс запускает только смена состава
+  группы, а для брокера мы живы
+end note
+Poll -> W0 : p0 читается как ни в чем не бывало
+
+== Отзыв партиций ==
+Cl -> Poll : OnPartitionsRevoked / Lost({t: [0,1]})
+Poll -> W0 : close(quit)
+Poll -> W1 : close(quit)
+W0 -> W0 : бросает текущий батч недоделанным
+W0 --> Poll : close(done)
+W1 --> Poll : close(done)
+Poll -> Poll : wg.Wait() - ждем всех
+note right
+  Брошенный батч не закоммичен
+  и перечитается новым владельцем
+  (at-least-once)
+end note
+@enduml

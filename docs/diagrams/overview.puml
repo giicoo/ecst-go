@@ -1,0 +1,47 @@
+@startuml
+title ecst-go: компоненты и потоки
+left to right direction
+
+package "Ваш сервис" {
+  [Бизнес-логика] as Biz
+  database "БД сервиса\n+ outbox-таблица" as DB
+  [Handler] as H
+  database "БД-копия\nчужих сущностей" as Read
+}
+
+package "ecst.Service" {
+  package "Outbox" {
+    [outboxWorker] as OW
+    [producer.Producer\n(публикация)] as P1
+  }
+  package "Inbox" {
+    [inboxWorker] as IW
+    [пул consumer.Consumer\nна топик] as C
+    [producer.Producer\n(DLQ)] as P2
+  }
+}
+
+cloud Kafka {
+  queue "orders" as T1
+  queue "users" as T2
+  queue "users.dlq" as D1
+}
+
+Biz --> DB : одна транзакция:\nUPDATE + INSERT outbox
+OW --> DB : Fetch / MarkSent / MarkFailed\n(OutboxStore)
+OW --> P1
+P1 --> T1 : ProduceSyncResults\nkey = entity_id
+
+T2 --> C : PollRecords
+IW --> C
+C --> H : envelope.Envelope[T]\n(декод в ecst.Topic)
+H --> Read : условный upsert по version
+C --> P2 : запись не пристроена
+P2 --> D1 : ProduceSync + dlq_* headers
+
+note bottom of P1
+  У Outbox и Inbox свои продюсеры:
+  поток публикации не должен занимать
+  буфер, из которого пишется DLQ
+end note
+@enduml

@@ -1,0 +1,94 @@
+@startuml
+title ecst-go: retry publish / retry consume
+hide footbox
+autonumber
+
+participant "Outbox worker" as Producer
+box "Kafka" #F5F5F5
+  queue "events" as Topic
+  queue "events.dlq" as DLQ
+end box
+participant "Inbox worker\n(воркер партиции)" as Consumer
+database "БД получателя" as DB
+database "outbox-таблица" as Outbox
+
+== Публикация ==
+
+Producer -> Outbox : Fetch(limit)\nFOR UPDATE SKIP LOCKED
+Outbox --> Producer : строки
+
+loop до ack, внутри RecordDeliveryTimeout
+  Producer -> Topic : ProduceSyncResults\n(key=entity_id, envelope)
+  alt ack
+    Topic --> Producer : ok
+    Producer -> Outbox : MarkSent(ids)
+    note right of Producer
+      контекст отвязан от отмены:
+      неотмеченная строка = дубль у получателя
+    end note
+  else retriable (timeout, NOT_LEADER, UNKNOWN_TOPIC)
+    Producer -> Producer : backoff + jitter (kgo)
+  else permanent (TOO_LARGE, INVALID_RECORD, auth)
+    Producer -> Outbox : MarkFailed(id, cause)
+    Producer -> Producer : log ERROR
+  end
+end
+note right of Producer
+  RecordDeliveryTimeout исчерпан:
+  строка остается неотмеченной,
+  следующий заход повторит - потерь нет
+end note
+
+== Потребление ==
+
+Consumer -> Topic : PollRecords(MaxPollRecords)
+Topic --> Consumer : батч -> воркеру своей партиции
+
+alt decode error (битый JSON, чужая схема)
+  note right of Consumer : ecst.Topic заворачивает\nв consumer.ErrPermanent
+  Consumer -> DLQ : ProduceSync(raw + headers)
+  DLQ --> Consumer : ack
+  Consumer -> Topic : CommitRecords
+else decode ok
+  loop пока transient error, max HandlerMaxAttempts
+    Consumer -> DB : условный upsert\n(WHERE stored.version < msg.version)
+    alt 1 row
+      DB --> Consumer : применено
+    else 0 rows
+      DB --> Consumer : дубликат / устарело -> nil
+    else transient (timeout, deadlock)
+      DB --> Consumer : ошибка
+      Consumer -> Consumer : backoff + jitter
+    else permanent (constraint)
+      DB --> Consumer : ErrPermanent -> выход из цикла
+    end
+  end
+
+  alt применено / дубликат
+    Consumer -> Topic : CommitRecords
+  else попытки исчерпаны или ErrPermanent
+    loop max DLQMaxAttempts
+      Consumer -> DLQ : ProduceSync(msg + headers)
+    end
+    alt DLQ подтвердила
+      DLQ --> Consumer : ack
+      Consumer -> Topic : CommitRecords
+    else DLQ недоступна
+      Consumer -> Consumer : воркер встает,\nPauseFetchPartitions, ERROR
+      note right : офсет не коммитится;\nзапись перечитается\nпосле рестарта
+    end
+  end
+end
+
+legend bottom left
+  |= Правило |= Зачем |
+  | key = entity_id | порядок событий сущности (одна партиция) |
+  | upsert ... WHERE stored.version < msg.version | проверка версии и запись атомарны, нет гонок |
+  | Delete = tombstone (deleted=true, version) | старое событие не воскресит удалённую запись |
+  | headers DLQ: dlq_source_topic/partition/offset/error/time | можно найти и переиграть сообщение |
+  | commit только после ack от DLQ | сообщение не теряется |
+  | MarkSent только после ack брокера | событие не теряется |
+  | в DLQ только то, что не лечится повтором | при сбое БД поток не сливается в DLQ |
+  | DLQ недоступна -> пауза партиции, без commit | офсет не перепрыгнет необработанную запись |
+endlegend
+@enduml
