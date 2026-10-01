@@ -144,8 +144,6 @@ return fmt.Errorf("db: %w", err)
 `RebalanceTimeout` должен быть больше времени обработки одного батча, иначе группа выпадет в
 бесконечный ребаланс. Регулировать через `MaxPollRecords` — это же размер батча между коммитами.
 
-Диаграмма: [`diagrams/consumer-pool.puml`](diagrams/consumer-pool.puml).
-
 ## DLQ
 
 ```go

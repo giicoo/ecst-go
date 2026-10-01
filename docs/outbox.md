@@ -125,8 +125,6 @@ e := envelope.New[Order]("order", id, version, envelope.OpDelete, nil).
 
 Ошибка захода воркера не роняет: строки остались неотмеченными и приедут в следующем заходе.
 
-Диаграмма: [`diagrams/outbox-cycle.puml`](diagrams/outbox-cycle.puml).
-
 ## Несколько инстансов
 
 `FOR UPDATE SKIP LOCKED` в `Fetch` — единственное, что нужно: инстансы разбирают непересекающиеся

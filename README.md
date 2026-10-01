@@ -283,7 +283,4 @@ go run ./example/ecst
 
 ![retry publish / retry consume](docs/diagrams/publish-consume.svg)
 
-Остальные — [один заход outbox-воркера](docs/diagrams/outbox-cycle.svg),
-[поллинг и ребаланс](docs/diagrams/consumer-pool.svg),
-[штатная остановка](docs/diagrams/shutdown.svg). Исходники и команда рендера —
-в [docs/architecture.md](docs/architecture.md#диаграммы).
+Исходники и команда рендера — в [docs/architecture.md](docs/architecture.md#диаграммы).

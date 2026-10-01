@@ -82,18 +82,6 @@ shutdown `ctx` уже отменен, и иначе недоотправленн
 
 ![retry publish / retry consume](diagrams/publish-consume.svg)
 
-### Один заход outbox-воркера
-
-![один заход outbox-воркера](diagrams/outbox-cycle.svg)
-
-### Поллинг, воркеры партиций, ребаланс
-
-![поллинг, воркеры, ребаланс](diagrams/consumer-pool.svg)
-
-### Штатная остановка
-
-![штатная остановка](diagrams/shutdown.svg)
-
 ### Рендер
 
 Исходники — `.puml` рядом с картинками. Пересобрать после правки:
